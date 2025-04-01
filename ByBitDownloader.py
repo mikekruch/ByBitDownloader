@@ -7,7 +7,8 @@ from datetime import datetime, timedelta, timezone
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QDateTimeEdit, QPushButton, QLineEdit, QTableWidget,
                              QDialog, QFormLayout, QMessageBox, QTableWidgetItem, QHeaderView,
-                             QStyledItemDelegate, QStyleOptionProgressBar, QStyle, QProgressBar)
+                             QStyledItemDelegate, QStyleOptionProgressBar, QStyle, QProgressBar,
+                             QStatusBar)
 from PyQt5.QtCore import Qt, QSettings, QTimer, pyqtSignal
 from PyQt5.QtGui import QKeyEvent, QIntValidator
 from qasync import QEventLoop, asyncSlot
@@ -76,6 +77,7 @@ class SortableTableWidget(QTableWidget):
         self.last_selected_row = -1
         self.setSelectionMode(QTableWidget.MultiSelection)
         self.setSelectionBehavior(QTableWidget.SelectRows)
+        self.loop = asyncio.get_event_loop()
 
     def mousePressEvent(self, event):
         if event.modifiers() & Qt.ShiftModifier:
@@ -170,41 +172,58 @@ class MainWindow(QMainWindow):
         self.download_progress = {}
         self.total_tasks = 0
         self.completed_tasks = 0
-        self.timers = []  # Для хранения всех таймеров
-        self.pool = None  # Для хранения пула подключений
+        self.timers = []
+        self.pool = None
         self.download_threads = int(self.settings.value("settings/threads", "5"))
         self.total_minutes = 0
         self.completed_minutes = 0
-        self.progress_update_timer = None  # Single timer for progress updates
+        self.progress_update_timer = None
+        self.calculated_tickers = 0
+        self.total_tickers_to_calculate = 0
+        self.active_threads = 0
        
         self.init_ui()
         self.refresh_tickers()
         self.load_selected_tickers()
         
-        # Используем единый таймер для обновлений
-        self.add_timer(1000, self.update_progress_bars)  # Обновление прогресс-баров раз в секунду
+        self.add_timer(1000, self.update_progress_bars)
     
+    def update_status_bar(self, message):
+        """Обновление строки состояния"""
+        self.status_bar.showMessage(message)
+        
+    def update_calculation_progress(self):
+        """Обновление прогресса расчета в строке состояния"""
+        if self.total_tickers_to_calculate > 0:
+            self.update_status_bar(
+                f"Расчет минут: {self.calculated_tickers}/{self.total_tickers_to_calculate} тикеров | "
+                f"Активных потоков: {self.active_threads}"
+            )
+        else:
+            self.update_status_bar(f"Активных потоков: {self.active_threads}")
+
     def update_progress_bars(self):
-        """Обновляет только прогресс-бары без перезагрузки тикеров"""
+        """Обновление прогресс-баров"""
         for row in range(self.tickers_table.rowCount()):
-            symbol = self.tickers_table.item(row, 0).text()
-            if symbol in self.download_progress:
-                progress_item = self.tickers_table.item(row, 4)
-                progress = self.download_progress[symbol]
-                progress_item.setData(Qt.DisplayRole, progress)
-    
-        # Обновляем общий прогресс
+            item = self.tickers_table.item(row, 0)
+            if item is not None:  # Добавляем проверку на None
+                symbol = item.text()
+                if symbol in self.download_progress:
+                    progress_item = self.tickers_table.item(row, 4)
+                    if progress_item is not None:  # Добавляем проверку на None
+                        progress = self.download_progress[symbol]
+                        progress_item.setData(Qt.DisplayRole, progress)
+        
         self.update_global_progress()
-        self.tickers_table.viewport().update() 
+        self.tickers_table.viewport().update()
 
     def add_timer(self, interval, callback):
-        """Централизованное создание таймеров"""
+        """Создание таймера"""
         timer = QTimer(self)
         timer.timeout.connect(callback)
         timer.start(interval)
         self.timers.append(timer)
         return timer
-
     
     def init_ui(self):
         central_widget = QWidget()
@@ -259,7 +278,7 @@ class MainWindow(QMainWindow):
         
         buttons_layout = QHBoxLayout()
         self.refresh_btn = QPushButton("Обновить")
-        self.refresh_btn.clicked.connect(self.refresh_tickers)
+        self.refresh_btn.clicked.connect(lambda: asyncio.create_task(self.refresh_tickers()))
         buttons_layout.addWidget(self.refresh_btn)
         
         self.save_tickers_btn = QPushButton("Сохранить тикеры")
@@ -321,21 +340,23 @@ class MainWindow(QMainWindow):
         
         layout.addLayout(buttons_layout)
         
+        # Строка состояния
+        self.status_bar = QStatusBar()
+        self.setStatusBar(self.status_bar)
+        self.update_status_bar("Готово")
+        
         central_widget.setLayout(layout)
 
         self.progress_update_timer = self.add_timer(1000, self.update_progress_bars)
     
     def closeEvent(self, event):
-        """Очистка ресурсов при закрытии окна"""
         self.shutdown = True
         
-        # Остановка всех таймеров
         for timer in self.timers:
             timer.stop()
             timer.deleteLater()
         self.timers.clear()
         
-        # Закрытие пула подключений
         if self.pool is not None:
             try:
                 loop = asyncio.get_event_loop()
@@ -347,16 +368,15 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
     
     def stop_loading(self):
-        """Остановка всех загрузок"""
         self.shutdown = True
         self.stop_btn.setEnabled(False)
         self.load_btn.setEnabled(True)
         
-        # Cancel all running tasks
         for task in asyncio.all_tasks():
             if not task.done():
                 task.cancel()
         
+        self.update_status_bar("Загрузка остановлена")
         QMessageBox.information(self, "Остановлено", "Загрузка данных была остановлена")
     
     def handle_shift_selection(self, from_row, to_row):
@@ -449,7 +469,7 @@ class MainWindow(QMainWindow):
             self.tickers_table.setItem(row, 1, volume_item)
             
             change_item = QTableWidgetItem(f"{float(change)*100:.2f}%")
-            change_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            change_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)  # Исправлено здесь
             self.tickers_table.setItem(row, 2, change_item)
             
             try:
@@ -469,31 +489,36 @@ class MainWindow(QMainWindow):
 
             if symbol in self.selected_tickers:
                 for col in range(5):
-                    self.tickers_table.item(row, col).setSelected(True)
+                    item = self.tickers_table.item(row, col)
+                    if item is not None:
+                        item.setSelected(True)
         
         self.tickers_table.sortItems(self.current_sort_column, self.current_sort_order)
-    
+        
     def load_selected_tickers(self):
+        """Загружает сохраненные тикеры из настроек"""
         selected = self.settings.value("selected_tickers", [])
         if isinstance(selected, str):
             selected = [selected] if selected else []
-        self.selected_tickers = set(selected)
+        self.selected_tickers = set(selected)    
     
     def save_selected_tickers(self):
+        """Сохраняет выбранные тикеры в настройки"""
         selected = []
         for row in range(self.tickers_table.rowCount()):
             if self.tickers_table.item(row, 0).isSelected():
                 selected.append(self.tickers_table.item(row, 0).text())
+        
         self.selected_tickers = set(selected)
         self.settings.setValue("selected_tickers", selected)
-        QMessageBox.information(self, "Сохранено", "Выбранные тикеры сохранены")
-    
+        self.update_status_bar(f"Сохранено {len(selected)} тикеров")
+        QMessageBox.information(self, "Сохранено", "Выбранные тикеры сохранены")    
+
     def open_settings(self):
         dialog = SettingsDialog(self)
         dialog.exec_()
     
     def update_progress(self, symbol, end_date=None):
-        """Обновление прогресса для конкретного тикера"""
         for row in range(self.tickers_table.rowCount()):
             if self.tickers_table.item(row, 0).text() == symbol:
                 progress_item = self.tickers_table.item(row, 4)
@@ -505,17 +530,16 @@ class MainWindow(QMainWindow):
                 break
     
     def update_global_progress(self):
-        """Обновление общего прогрессбара на основе минут"""
         if self.total_minutes > 0:
             progress = int((self.completed_minutes / self.total_minutes) * 100)
             self.global_progress.setValue(progress)
             self.global_progress.setFormat(f"{progress}% ({self.completed_minutes:,}/{self.total_minutes:,} минут)")
 
-
     @asyncSlot()
     async def refresh_tickers(self):
         try:
             self.refresh_btn.setEnabled(False)
+            self.tickers_table.clear()
             self.tickers_table.setRowCount(1)
             self.tickers_table.setItem(0, 0, QTableWidgetItem("Загрузка тикеров..."))
             
@@ -526,7 +550,6 @@ class MainWindow(QMainWindow):
                 async with session.get(url, params=params) as response:
                     data = await response.json()
                     
-                    # More robust error handling
                     if not isinstance(data, dict):
                         raise ValueError("Invalid API response format")
                     
@@ -541,10 +564,11 @@ class MainWindow(QMainWindow):
                     self.display_tickers(self.all_tickers_data)
                     
         except Exception as e:
-            QMessageBox.critical(self, "Ошибка", f"Ошибка при загрузке тикеров: {str(e)}")
+            logging.error(f"Ошибка при обновлении тикеров: {str(e)}")
+            self.update_status_bar(f"Ошибка: {str(e)}")
         finally:
             self.refresh_btn.setEnabled(True)
-
+        
     async def start_loading(self):
         selected_tickers = []
         for row in range(self.tickers_table.rowCount()):
@@ -552,6 +576,7 @@ class MainWindow(QMainWindow):
                 selected_tickers.append(self.tickers_table.item(row, 0).text())
         
         if not selected_tickers:
+            self.update_status_bar("Не выбраны тикеры для загрузки")
             QMessageBox.warning(self, "Ошибка", "Не выбраны тикеры для загрузки")
             return
         
@@ -561,6 +586,7 @@ class MainWindow(QMainWindow):
         end_date = datetime(end_date_.year, end_date_.month, end_date_.day, end_date_.hour, end_date_.minute)
         
         if start_date >= end_date:
+            self.update_status_bar("Дата начала должна быть раньше даты окончания")
             QMessageBox.warning(self, "Ошибка", "Дата начала должна быть раньше даты окончания")
             return
         
@@ -569,15 +595,18 @@ class MainWindow(QMainWindow):
         self.stop_btn.setEnabled(True)
         self.setCursor(Qt.WaitCursor)
         
-        # Calculate total minutes for progress tracking
-        self.total_minutes = int((end_date - start_date).total_seconds() / 60) * len(selected_tickers)
+        # Сброс счетчиков
+        self.total_minutes = 0
         self.completed_minutes = 0
+        self.calculated_tickers = 0
+        self.total_tickers_to_calculate = len(selected_tickers)
+        self.active_threads = 0
         
-        # Reset progress
+        # Сброс прогресса
         for symbol in selected_tickers:
             self.download_progress[symbol] = {
                 'progress': 0,
-                'total': int((end_date - start_date).total_seconds() / 60),
+                'total': 0,
                 'completed': 0
             }
             self.update_progress(symbol)
@@ -601,18 +630,37 @@ class MainWindow(QMainWindow):
                 await self.create_schema_if_not_exists(pool, schema)
                 
                 tasks = []
+                semaphore = asyncio.Semaphore(self.download_threads)
+                
+                # Сначала рассчитываем общее количество минут для прогресса
+                missing_periods_by_symbol = {}
                 for symbol in selected_tickers:
                     missing_periods = await self.check_missing_data(pool, schema, symbol, start_date, end_date)
+                    missing_periods_by_symbol[symbol] = missing_periods
                     
                     if not missing_periods:
                         self.download_progress[symbol]['progress'] = 100
-                        self.download_progress[symbol]['completed'] = self.download_progress[symbol]['total']
-                        self.completed_minutes += self.download_progress[symbol]['total']
+                        self.download_progress[symbol]['completed'] = 0
+                        self.download_progress[symbol]['total'] = 0
                         self.update_progress(symbol)
                         continue
                     
-                    # Create semaphore to limit concurrent downloads
-                    semaphore = asyncio.Semaphore(self.download_threads)
+                    # Рассчитываем общее количество минут для этого тикера
+                    total_minutes = 0
+                    for period_start, period_end in missing_periods:
+                        total_minutes += (period_end - period_start).total_seconds() / 60
+                    
+                    self.download_progress[symbol]['total'] = int(total_minutes)
+                    self.total_minutes += int(total_minutes)
+                
+                self.update_global_progress()
+                
+                # Затем запускаем загрузку
+                for symbol in selected_tickers:
+                    missing_periods = missing_periods_by_symbol[symbol]
+                    
+                    if not missing_periods:
+                        continue
                     
                     for period_start, period_end in missing_periods:
                         tasks.append(
@@ -620,18 +668,19 @@ class MainWindow(QMainWindow):
                         )
                 
                 if tasks:
-                    # Create a task for gathering to allow proper cleanup
                     await asyncio.gather(*tasks, return_exceptions=True)
                     
-                    # Check if any tasks failed
                     failed = any(isinstance(task, Exception) for task in tasks)
                     if failed and not self.shutdown:
+                        self.update_status_bar("Некоторые задачи завершились с ошибками")
                         QMessageBox.warning(self, "Предупреждение", 
                                         "Некоторые задачи завершились с ошибками. Проверьте логи.")
                     elif not self.shutdown:
+                        self.update_status_bar("Данные успешно загружены")
                         QMessageBox.information(self, "Успех", "Данные успешно загружены")
                     
         except Exception as e:
+            self.update_status_bar(f"Ошибка: {str(e)}")
             if not self.shutdown:
                 QMessageBox.critical(self, "Ошибка", f"Ошибка при загрузке данных: {str(e)}")
         finally:
@@ -647,75 +696,80 @@ class MainWindow(QMainWindow):
                     self.timers.remove(timer)
 
     async def check_missing_data(self, pool, schema, symbol, start_date, end_date):
-        table_name = f"klines_{symbol.lower()}"
-        missing_periods = []
-        
-        async with pool.acquire() as conn:
-            table_exists = await conn.fetchval(
-                "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_schema = $1 AND table_name = $2)",
-                schema, table_name
-            )
+        self.update_status_bar(f"Проверка данных для {symbol}...")
+        try:
+            table_name = f"klines_{symbol.lower()}"
+            missing_periods = []
             
-            if not table_exists:
-                # Split by months if period is large
-                if (end_date - start_date) > timedelta(days=30):
-                    current_start = start_date
-                    while current_start < end_date:
-                        next_month = datetime(current_start.year, current_start.month, 1) + timedelta(days=32)
-                        month_end = min(datetime(next_month.year, next_month.month, 1) - timedelta(seconds=1), end_date)
-                        missing_periods.append((current_start, month_end))
-                        current_start = month_end + timedelta(seconds=1)
-                else:
-                    missing_periods.append((start_date, end_date))
-                return missing_periods
-            
-            # Check for missing data month by month to avoid huge queries
-            current_month_start = datetime(start_date.year, start_date.month, 1)
-            while current_month_start < end_date:
-                next_month = datetime(current_month_start.year, current_month_start.month, 1) + timedelta(days=32)
-                month_end = min(datetime(next_month.year, next_month.month, 1) - timedelta(seconds=1), end_date)
-                
-                month_start = max(current_month_start, start_date)
-                month_end = min(month_end, end_date)
-                
-                gaps = await conn.fetch(
-                    f"""
-                    WITH time_range AS (
-                        SELECT generate_series(
-                            $1::timestamp,
-                            $2::timestamp,
-                            interval '1 minute'
-                        ) AS time_point
-                    ),
-                    existing_data AS (
-                        SELECT timestamp FROM {schema}.{table_name}
-                        WHERE timestamp BETWEEN $1 AND $2
-                    )
-                    SELECT time_point FROM time_range
-                    WHERE NOT EXISTS (
-                        SELECT 1 FROM existing_data
-                        WHERE timestamp = time_point
-                    )
-                    ORDER BY time_point
-                    """,
-                    month_start, month_end
+            async with pool.acquire() as conn:
+                table_exists = await conn.fetchval(
+                    "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_schema = $1 AND table_name = $2)",
+                    schema, table_name
                 )
                 
-                if gaps:
-                    current_start = gaps[0]['time_point']
-                    prev_time = current_start
-                    
-                    for gap in gaps[1:]:
-                        if (gap['time_point'] - prev_time) > timedelta(minutes=1):
-                            missing_periods.append((current_start, prev_time))
-                            current_start = gap['time_point']
-                        prev_time = gap['time_point']
-                    
-                    missing_periods.append((current_start, prev_time))
+                if not table_exists:
+                    if (end_date - start_date) > timedelta(days=30):
+                        current_start = start_date
+                        while current_start < end_date:
+                            next_month = datetime(current_start.year, current_start.month, 1) + timedelta(days=32)
+                            month_end = min(datetime(next_month.year, next_month.month, 1) - timedelta(seconds=1), end_date)
+                            missing_periods.append((current_start, month_end))
+                            current_start = month_end + timedelta(seconds=1)
+                    else:
+                        missing_periods.append((start_date, end_date))
+                    return missing_periods
                 
-                current_month_start = month_end + timedelta(seconds=1)
+                current_month_start = datetime(start_date.year, start_date.month, 1)
+                while current_month_start < end_date:
+                    next_month = datetime(current_month_start.year, current_month_start.month, 1) + timedelta(days=32)
+                    month_end = min(datetime(next_month.year, next_month.month, 1) - timedelta(seconds=1), end_date)
+                    
+                    month_start = max(current_month_start, start_date)
+                    month_end = min(month_end, end_date)
+                    
+                    gaps = await conn.fetch(
+                        f"""
+                        WITH time_range AS (
+                            SELECT generate_series(
+                                $1::timestamp,
+                                $2::timestamp,
+                                interval '1 minute'
+                            ) AS time_point
+                        ),
+                        existing_data AS (
+                            SELECT timestamp FROM {schema}.{table_name}
+                            WHERE timestamp BETWEEN $1 AND $2
+                        )
+                        SELECT time_point FROM time_range
+                        WHERE NOT EXISTS (
+                            SELECT 1 FROM existing_data
+                            WHERE timestamp = time_point
+                        )
+                        ORDER BY time_point
+                        """,
+                        month_start, month_end
+                    )
+                    
+                    if gaps:
+                        current_start = gaps[0]['time_point']
+                        prev_time = current_start
+                        
+                        for gap in gaps[1:]:
+                            if (gap['time_point'] - prev_time) > timedelta(minutes=1):
+                                missing_periods.append((current_start, prev_time))
+                                current_start = gap['time_point']
+                            prev_time = gap['time_point']
+                        
+                        missing_periods.append((current_start, prev_time))
+                    
+                    current_month_start = month_end + timedelta(seconds=1)
             
+            self.calculated_tickers += 1
+            self.update_calculation_progress()
             return missing_periods
+        except Exception as e:
+            self.update_status_bar(f"Ошибка при проверке данных для {symbol}: {str(e)}")
+            raise
     
     async def create_schema_if_not_exists(self, pool, schema):
         async with pool.acquire() as conn:
@@ -724,60 +778,70 @@ class MainWindow(QMainWindow):
     async def download_symbol_data(self, pool, schema, symbol, start_date, end_date, semaphore=None):
         if self.shutdown:
             return
+            
+        self.active_threads += 1
+        self.update_calculation_progress()
         
-        async with semaphore:
-            table_name = f"klines_{symbol.lower()}"
-            total_minutes = (end_date - start_date).total_seconds() / 60
-            processed_minutes = 0
-            
-            self.update_progress(symbol, start_date)
-            
-            async with pool.acquire() as conn:
-                await conn.execute(f"""
-                CREATE TABLE IF NOT EXISTS {schema}.{table_name} (
-                    timestamp TIMESTAMP PRIMARY KEY,
-                    open DECIMAL,
-                    high DECIMAL,
-                    low DECIMAL,
-                    close DECIMAL,
-                    volume DECIMAL,
-                    turnover DECIMAL
-                )
-                """)
-            
-            async with aiohttp.ClientSession() as session:
-                current_start = start_date
+        try:
+            async with semaphore:
+                table_name = f"klines_{symbol.lower()}"
+                total_minutes = (end_date - start_date).total_seconds() / 60
+                processed_minutes = 0
                 
-                while current_start < end_date and not self.shutdown:
-                    current_end = min(current_start + timedelta(minutes=600), end_date)
+                self.update_progress(symbol, start_date)
+                
+                async with pool.acquire() as conn:
+                    await conn.execute(f"""
+                    CREATE TABLE IF NOT EXISTS {schema}.{table_name} (
+                        timestamp TIMESTAMP PRIMARY KEY,
+                        open DECIMAL,
+                        high DECIMAL,
+                        low DECIMAL,
+                        close DECIMAL,
+                        volume DECIMAL,
+                        turnover DECIMAL
+                    )
+                    """)
+                
+                async with aiohttp.ClientSession() as session:
+                    current_start = start_date
                     
-                    klines = await self.fetch_klines(session, symbol, start_time=current_start, end_time=current_end)
-                    
-                    if klines:
-                        await self.save_klines(pool, schema, table_name, klines)
-                        last_timestamp = datetime.utcfromtimestamp(int(klines[0][0]) / 1000)
-                        minutes_processed = (last_timestamp - current_start).total_seconds() / 60
-                        processed_minutes += minutes_processed
-                        self.completed_minutes += minutes_processed
-                        current_start = last_timestamp + timedelta(minutes=1)
+                    while current_start < end_date and not self.shutdown:
+                        current_end = min(current_start + timedelta(minutes=600), end_date)
                         
-                        progress = int((processed_minutes / total_minutes) * 100)
-                        self.download_progress[symbol]['progress'] = min(progress, 100)
-                        self.download_progress[symbol]['completed'] = processed_minutes
-                        self.update_progress(symbol, current_start)
-                        self.update_global_progress()
-                    else:
-                        minutes_processed = (current_end - current_start).total_seconds() / 60
-                        processed_minutes += minutes_processed
-                        self.completed_minutes += minutes_processed
-                        current_start = current_end
-                    
-                    await asyncio.sleep(0.1)
-            
-            if not self.shutdown:
-                self.download_progress[symbol]['progress'] = 100
-                self.download_progress[symbol]['completed'] = self.download_progress[symbol]['total']
-                self.update_progress(symbol, end_date)
+                        klines = await self.fetch_klines(session, symbol, start_time=current_start, end_time=current_end)
+                        
+                        if klines:
+                            await self.save_klines(pool, schema, table_name, klines)
+                            last_timestamp = datetime.utcfromtimestamp(int(klines[0][0]) / 1000)
+                            minutes_processed = (last_timestamp - current_start).total_seconds() / 60
+                            processed_minutes += minutes_processed
+                            self.completed_minutes += minutes_processed
+                            current_start = last_timestamp + timedelta(minutes=1)
+                            
+                            progress = int((processed_minutes / total_minutes) * 100)
+                            self.download_progress[symbol]['progress'] = min(progress, 100)
+                            self.download_progress[symbol]['completed'] = processed_minutes
+                            self.update_progress(symbol, current_start)
+                            self.update_global_progress()
+                        else:
+                            minutes_processed = (current_end - current_start).total_seconds() / 60
+                            processed_minutes += minutes_processed
+                            self.completed_minutes += minutes_processed
+                            current_start = current_end
+                        
+                        await asyncio.sleep(0.1)
+                
+                if not self.shutdown:
+                    self.download_progress[symbol]['progress'] = 100
+                    self.download_progress[symbol]['completed'] = self.download_progress[symbol]['total']
+                    self.update_progress(symbol, end_date)
+        except Exception as e:
+            self.update_status_bar(f"Ошибка при загрузке {symbol}: {str(e)}")
+            raise
+        finally:
+            self.active_threads -= 1
+            self.update_calculation_progress()
 
     async def fetch_klines(self, session, symbol, start_time=None, end_time=None):
         if self.shutdown:
@@ -851,12 +915,10 @@ class MainWindow(QMainWindow):
 def run_app():
     app = QApplication(sys.argv)
     
-    # Настройки для Windows
     if sys.platform == 'win32':
         app.setAttribute(Qt.AA_DisableWindowContextHelpButton)
         app.setStyle('Fusion')
     
-    # Настройка event loop
     loop = QEventLoop(app)
     asyncio.set_event_loop(loop)
     
