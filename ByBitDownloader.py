@@ -522,7 +522,7 @@ class MainWindow(QMainWindow):
         for row in range(self.tickers_table.rowCount()):
             if self.tickers_table.item(row, 0).text() == symbol:
                 progress_item = self.tickers_table.item(row, 4)
-                progress_data = self.download_progress.get(symbol, {'progress': 0, 'completed': 0, 'total': 1})
+                progress_data = self.download_progress.get(symbol, {'progress': 0, 'completed': 0, 'total': 0})
                 progress_item.setData(Qt.DisplayRole, progress_data)
                 if end_date:
                     progress_item.setData(Qt.UserRole, end_date)
@@ -634,8 +634,9 @@ class MainWindow(QMainWindow):
                 
                 # Сначала рассчитываем общее количество минут для прогресса
                 missing_periods_by_symbol = {}
-                for symbol in selected_tickers:
-                    missing_periods = await self.check_missing_data(pool, schema, symbol, start_date, end_date)
+                countTickers = len(selected_tickers)
+                for i, symbol in enumerate(selected_tickers):
+                    missing_periods = await self.check_missing_data(pool, schema, symbol, start_date, end_date, i, countTickers)
                     missing_periods_by_symbol[symbol] = missing_periods
                     
                     if not missing_periods:
@@ -695,8 +696,8 @@ class MainWindow(QMainWindow):
                     timer.deleteLater()
                     self.timers.remove(timer)
 
-    async def check_missing_data(self, pool, schema, symbol, start_date, end_date):
-        self.update_status_bar(f"Проверка данных для {symbol}...")
+    async def check_missing_data(self, pool, schema, symbol, start_date, end_date, i, countTickers):
+        self.update_status_bar(f"Проверка данных для {symbol}...({i} из {countTickers})")
         try:
             table_name = f"klines_{symbol.lower()}"
             missing_periods = []
@@ -812,8 +813,8 @@ class MainWindow(QMainWindow):
                         klines = await self.fetch_klines(session, symbol, start_time=current_start, end_time=current_end)
                         
                         if klines:
+                            last_timestamp = datetime.fromtimestamp(int(klines[0][0]) / 1000)
                             await self.save_klines(pool, schema, table_name, klines)
-                            last_timestamp = datetime.utcfromtimestamp(int(klines[0][0]) / 1000)
                             minutes_processed = (last_timestamp - current_start).total_seconds() / 60
                             processed_minutes += minutes_processed
                             self.completed_minutes += minutes_processed
@@ -870,7 +871,7 @@ class MainWindow(QMainWindow):
                 content_type = response.headers.get('Content-Type', '')
                 if 'application/json' not in content_type:
                     text = await response.text()
-                    print(f"Unexpected content type: {content_type}, response: {text}")
+                    self.update_status_bar(f"Unexpected content type: {content_type}, response: {text}")
                     return None
                 
                 data = await response.json()
@@ -878,10 +879,10 @@ class MainWindow(QMainWindow):
                 if data.get('retCode') == 0:
                     return data['result']['list']
                 else:
-                    print(f"Ошибка получения данных для {symbol}: {data.get('retMsg', 'Unknown error')}")
+                    self.update_status_bar(f"Ошибка получения данных для {symbol}: {data.get('retMsg', 'Unknown error')}")
                     return None
         except Exception as e:
-            print(f"Ошибка при запросе данных для {symbol}: {str(e)}")
+            self.update_status_bar(f"Ошибка при запросе данных для {symbol}: {str(e)}")
             return None
     
     async def save_klines(self, pool, schema, table_name, klines):
@@ -891,7 +892,7 @@ class MainWindow(QMainWindow):
         async with pool.acquire() as conn:
             values = []
             for kline in reversed(klines):
-                timestamp = datetime.utcfromtimestamp(int(kline[0]) / 1000)
+                timestamp = datetime.fromtimestamp(int(kline[0]) / 1000)
                 values.append((
                     timestamp,
                     float(kline[1]),
@@ -933,5 +934,5 @@ if __name__ == "__main__":
         from qasync import QEventLoop
         run_app()
     except ImportError as e:
-        print(f"Ошибка: {e}. Требуется установить qasync (pip install qasync)")
+        self.update_status_bar(f"Ошибка: {e}. Требуется установить qasync (pip install qasync)")
         sys.exit(1)
