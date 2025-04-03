@@ -1,5 +1,6 @@
 import sys
 import asyncio
+from asyncio import Queue, Semaphore, Lock
 import aiohttp
 import asyncpg
 import ctypes
@@ -580,36 +581,21 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Ошибка", "Не выбраны тикеры для загрузки")
             return
         
-        start_date_ = self.from_datetime.dateTime().toPyDateTime()
-        start_date = datetime(start_date_.year, start_date_.month, start_date_.day, start_date_.hour, start_date_.minute)
-        end_date_ = self.to_datetime.dateTime().toPyDateTime()
-        end_date = datetime(end_date_.year, end_date_.month, end_date_.day, end_date_.hour, end_date_.minute)
-        
-        if start_date >= end_date:
-            self.update_status_bar("Дата начала должна быть раньше даты окончания")
-            QMessageBox.warning(self, "Ошибка", "Дата начала должна быть раньше даты окончания")
-            return
+        # Инициализация параметров загрузки
+        start_date = self.from_datetime.dateTime().toPyDateTime()
+        end_date = self.to_datetime.dateTime().toPyDateTime()
         
         self.shutdown = False
         self.load_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self.setCursor(Qt.WaitCursor)
         
-        # Сброс счетчиков
+        # Сброс счетчиков прогресса
         self.total_minutes = 0
         self.completed_minutes = 0
         self.calculated_tickers = 0
         self.total_tickers_to_calculate = len(selected_tickers)
         self.active_threads = 0
-        
-        # Сброс прогресса
-        for symbol in selected_tickers:
-            self.download_progress[symbol] = {
-                'progress': 0,
-                'total': 0,
-                'completed': 0
-            }
-            self.update_progress(symbol)
         
         try:
             settings = QSettings("settings.ini", QSettings.IniFormat)
@@ -629,49 +615,95 @@ class MainWindow(QMainWindow):
                 schema = settings.value("settings/schema", "bybit_data")
                 await self.create_schema_if_not_exists(pool, schema)
                 
-                tasks = []
                 semaphore = asyncio.Semaphore(self.download_threads)
+                download_tasks = []
+                calculation_tasks = []
                 
-                # Сначала рассчитываем общее количество минут для прогресса
-                missing_periods_by_symbol = {}
-                countTickers = len(selected_tickers)
-                for i, symbol in enumerate(selected_tickers):
-                    missing_periods = await self.check_missing_data(pool, schema, symbol, start_date, end_date, i, countTickers)
-                    missing_periods_by_symbol[symbol] = missing_periods
-                    
-                    if not missing_periods:
-                        self.download_progress[symbol]['progress'] = 100
-                        self.download_progress[symbol]['completed'] = 0
-                        self.download_progress[symbol]['total'] = 0
-                        self.update_progress(symbol)
-                        continue
-                    
-                    # Рассчитываем общее количество минут для этого тикера
-                    total_minutes = 0
-                    for period_start, period_end in missing_periods:
-                        total_minutes += (period_end - period_start).total_seconds() / 60
-                    
-                    self.download_progress[symbol]['total'] = int(total_minutes)
-                    self.total_minutes += int(total_minutes)
+                # Создаем очередь для тикеров, готовых к загрузке
+                ticker_queue = asyncio.Queue()
                 
-                self.update_global_progress()
+                async def calculate_missing_periods(symbol):
+                    """Асинхронно рассчитывает недостающие периоды для символа"""
+                    try:
+                        missing_periods = await self.check_missing_data(pool, schema, symbol, start_date, end_date)
+                        if missing_periods:
+                            total_minutes = sum((end - start).total_seconds() / 60 
+                                            for start, end in missing_periods)
+                            self.download_progress[symbol] = {
+                                'progress': 0,
+                                'total': int(total_minutes),
+                                'completed': 0
+                            }
+                            # Добавляем в очередь для загрузки
+                            await ticker_queue.put((symbol, missing_periods))
+                            # Атомарно увеличиваем счетчик минут
+                            async with asyncio.Lock():
+                                self.total_minutes += int(total_minutes)
+                        else:
+                            self.download_progress[symbol] = {
+                                'progress': 100,
+                                'total': 0,
+                                'completed': 0
+                            }
+                        
+                        self.calculated_tickers += 1
+                        self.update_calculation_progress()
+                    except Exception as e:
+                        logging.error(f"Ошибка расчета для {symbol}: {str(e)}")
+                        self.update_status_bar(f"Ошибка расчета для {symbol}")
                 
-                # Затем запускаем загрузку
+                async def download_worker():
+                    """Рабочий процесс для загрузки данных"""
+                    while not self.shutdown:
+                        try:
+                            symbol, periods = await asyncio.wait_for(
+                                ticker_queue.get(), 
+                                timeout=1.0
+                            )
+                            
+                            for period_start, period_end in periods:
+                                if self.shutdown:
+                                    break
+                                task = asyncio.create_task(
+                                    self.download_symbol_data(
+                                        pool, schema, symbol, 
+                                        period_start, period_end, 
+                                        semaphore
+                                    )
+                                )
+                                download_tasks.append(task)
+                                
+                            ticker_queue.task_done()
+                        except asyncio.TimeoutError:
+                            if ticker_queue.empty() and all(t.done() for t in calculation_tasks):
+                                break
+                
+                # Запускаем рабочие процессы для загрузки
+                download_workers = [
+                    asyncio.create_task(download_worker()) 
+                    for _ in range(self.download_threads)
+                ]
+                
+                # Запускаем расчет недостающих периодов для всех тикеров
                 for symbol in selected_tickers:
-                    missing_periods = missing_periods_by_symbol[symbol]
-                    
-                    if not missing_periods:
-                        continue
-                    
-                    for period_start, period_end in missing_periods:
-                        tasks.append(
-                            self.download_symbol_data(pool, schema, symbol, period_start, period_end, semaphore)
-                        )
+                    calculation_tasks.append(asyncio.create_task(
+                        calculate_missing_periods(symbol)
+                    ))
                 
-                if tasks:
-                    await asyncio.gather(*tasks, return_exceptions=True)
+                # Ждем завершения всех задач
+                await asyncio.gather(*calculation_tasks)
+                await ticker_queue.join()
+                
+                # Отменяем рабочие процессы загрузки
+                for worker in download_workers:
+                    worker.cancel()
+                
+                # Ждем завершения оставшихся задач загрузки
+                if download_tasks and not self.shutdown:
+                    await asyncio.gather(*download_tasks, return_exceptions=True)
                     
-                    failed = any(isinstance(task, Exception) for task in tasks)
+                    # Проверяем ошибки
+                    failed = any(isinstance(task, Exception) for task in download_tasks)
                     if failed and not self.shutdown:
                         self.update_status_bar("Некоторые задачи завершились с ошибками")
                         QMessageBox.warning(self, "Предупреждение", 
@@ -679,7 +711,7 @@ class MainWindow(QMainWindow):
                     elif not self.shutdown:
                         self.update_status_bar("Данные успешно загружены")
                         QMessageBox.information(self, "Успех", "Данные успешно загружены")
-                    
+                
         except Exception as e:
             self.update_status_bar(f"Ошибка: {str(e)}")
             if not self.shutdown:
@@ -689,12 +721,6 @@ class MainWindow(QMainWindow):
             self.stop_btn.setEnabled(False)
             self.setCursor(Qt.ArrowCursor)
             self.global_progress.setValue(100)
-
-            for timer in list(self.timers):
-                if timer != self.progress_update_timer:
-                    timer.stop()
-                    timer.deleteLater()
-                    self.timers.remove(timer)
 
     async def check_missing_data(self, pool, schema, symbol, start_date, end_date, i, countTickers):
         self.update_status_bar(f"Проверка данных для {symbol}...({i} из {countTickers})")
@@ -779,7 +805,7 @@ class MainWindow(QMainWindow):
     async def download_symbol_data(self, pool, schema, symbol, start_date, end_date, semaphore=None):
         if self.shutdown:
             return
-            
+                
         self.active_threads += 1
         self.update_calculation_progress()
         
@@ -812,9 +838,13 @@ class MainWindow(QMainWindow):
                         
                         klines = await self.fetch_klines(session, symbol, start_time=current_start, end_time=current_end)
                         
-                        if klines:
-                            last_timestamp = datetime.fromtimestamp(int(klines[0][0]) / 1000)
+                        if klines is None:  # Если fetch_klines вернул None после всех попыток
+                            self.shutdown = True
+                            break
+                            
+                        if klines:  # Если данные получены успешно
                             await self.save_klines(pool, schema, table_name, klines)
+                            last_timestamp = datetime.utcfromtimestamp(int(klines[0][0]) / 1000)
                             minutes_processed = (last_timestamp - current_start).total_seconds() / 60
                             processed_minutes += minutes_processed
                             self.completed_minutes += minutes_processed
@@ -832,58 +862,112 @@ class MainWindow(QMainWindow):
                             current_start = current_end
                         
                         await asyncio.sleep(0.1)
-                
-                if not self.shutdown:
-                    self.download_progress[symbol]['progress'] = 100
-                    self.download_progress[symbol]['completed'] = self.download_progress[symbol]['total']
-                    self.update_progress(symbol, end_date)
+                    
+                    if not self.shutdown:
+                        self.download_progress[symbol]['progress'] = 100
+                        self.download_progress[symbol]['completed'] = self.download_progress[symbol]['total']
+                        self.update_progress(symbol, end_date)
         except Exception as e:
-            self.update_status_bar(f"Ошибка при загрузке {symbol}: {str(e)}")
-            raise
+            error_msg = f"Ошибка при загрузке {symbol}: {str(e)}"
+            logging.error(error_msg)
+            self.update_status_bar(error_msg)
         finally:
             self.active_threads -= 1
             self.update_calculation_progress()
 
     async def fetch_klines(self, session, symbol, start_time=None, end_time=None):
-        if self.shutdown:
-            return None
+        """Запрашивает данные с биржи с повторными попытками при ошибках"""
+        max_retries = 3
+        retry_delay = 2  # секунды
+        last_error = None
+        
+        for attempt in range(max_retries):
+            if self.shutdown:
+                return None
+                
+            url = "https://api.bybit.com/v5/market/kline"
+            params = {
+                'category': 'spot',
+                'symbol': symbol,
+                'interval': '1',
+                'limit': 600
+            }
             
-        url = "https://api.bybit.com/v5/market/kline"
-        params = {
-            'category': 'spot',
-            'symbol': symbol,
-            'interval': '1',
-            'limit': 600
-        }
-        
-        if start_time:
-            params['start'] = int(start_time.timestamp() * 1000)
-        if end_time:
-            params['end'] = int(end_time.timestamp() * 1000)
-        
-        headers = {
-            'Accept': 'application/json',
-            'User-Agent': 'Mozilla/5.0'
-        }
-        
-        try:
-            async with session.get(url, params=params, headers=headers) as response:
-                content_type = response.headers.get('Content-Type', '')
-                if 'application/json' not in content_type:
-                    text = await response.text()
-                    self.update_status_bar(f"Unexpected content type: {content_type}, response: {text}")
-                    return None
-                
-                data = await response.json()
-                
-                if data.get('retCode') == 0:
+            if start_time:
+                params['start'] = int(start_time.timestamp() * 1000)
+            if end_time:
+                params['end'] = int(end_time.timestamp() * 1000)
+            
+            headers = {
+                'Accept': 'application/json',
+                'User-Agent': 'Mozilla/5.0'
+            }
+            
+            try:
+                async with session.get(url, params=params, headers=headers) as response:
+                    # Проверка статуса ответа
+                    if response.status != 200:
+                        error_text = await response.text()
+                        last_error = f"HTTP {response.status}: {error_text}"
+                        logging.error(f"Attempt {attempt + 1} failed for {symbol}: {last_error}")
+                        await asyncio.sleep(retry_delay)
+                        continue
+                    
+                    # Проверка формата данных
+                    content_type = response.headers.get('Content-Type', '')
+                    if 'application/json' not in content_type:
+                        error_text = await response.text()
+                        last_error = f"Invalid content type: {content_type}, response: {error_text}"
+                        logging.error(f"Attempt {attempt + 1} failed for {symbol}: {last_error}")
+                        await asyncio.sleep(retry_delay)
+                        continue
+                    
+                    # Парсинг JSON
+                    try:
+                        data = await response.json()
+                    except Exception as e:
+                        last_error = f"JSON parse error: {str(e)}"
+                        logging.error(f"Attempt {attempt + 1} failed for {symbol}: {last_error}")
+                        await asyncio.sleep(retry_delay)
+                        continue
+                    
+                    # Проверка структуры ответа
+                    if not isinstance(data, dict):
+                        last_error = "Response is not a dictionary"
+                        logging.error(f"Attempt {attempt + 1} failed for {symbol}: {last_error}")
+                        await asyncio.sleep(retry_delay)
+                        continue
+                    
+                    # Проверка кода ошибки
+                    if data.get('retCode') != 0:
+                        ret_msg = data.get('retMsg', 'Unknown error')
+                        last_error = f"API error: {ret_msg}"
+                        logging.error(f"Attempt {attempt + 1} failed for {symbol}: {last_error}")
+                        await asyncio.sleep(retry_delay)
+                        continue
+                    
+                    # Проверка наличия данных
+                    if not isinstance(data.get('result', {}).get('list'), list):
+                        last_error = "Invalid data format in response"
+                        logging.error(f"Attempt {attempt + 1} failed for {symbol}: {last_error}")
+                        await asyncio.sleep(retry_delay)
+                        continue
+                    
+                    # Успешный запрос
                     return data['result']['list']
-                else:
-                    self.update_status_bar(f"Ошибка получения данных для {symbol}: {data.get('retMsg', 'Unknown error')}")
-                    return None
-        except Exception as e:
-            self.update_status_bar(f"Ошибка при запросе данных для {symbol}: {str(e)}")
-            return None
+                    
+            except Exception as e:
+                last_error = f"Request failed: {str(e)}"
+                logging.error(f"Attempt {attempt + 1} failed for {symbol}: {last_error}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(retry_delay)
+        
+        # Все попытки неудачны
+        error_msg = f"Не удалось получить данные для {symbol} после {max_retries} попыток. Последняя ошибка: {last_error}"
+        logging.error(error_msg)
+        self.update_status_bar(error_msg)
+        QMessageBox.critical(self, "Ошибка загрузки", error_msg)
+        return None
     
     async def save_klines(self, pool, schema, table_name, klines):
         if self.shutdown or not klines:
@@ -934,5 +1018,4 @@ if __name__ == "__main__":
         from qasync import QEventLoop
         run_app()
     except ImportError as e:
-        self.update_status_bar(f"Ошибка: {e}. Требуется установить qasync (pip install qasync)")
         sys.exit(1)
