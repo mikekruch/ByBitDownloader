@@ -722,8 +722,8 @@ class MainWindow(QMainWindow):
             self.setCursor(Qt.ArrowCursor)
             self.global_progress.setValue(100)
 
-    async def check_missing_data(self, pool, schema, symbol, start_date, end_date, i, countTickers):
-        self.update_status_bar(f"Проверка данных для {symbol}...({i} из {countTickers})")
+    async def check_missing_data(self, pool, schema, symbol, start_date, end_date):
+        self.update_status_bar(f"Проверка данных для {symbol}")
         try:
             table_name = f"klines_{symbol.lower()}"
             missing_periods = []
