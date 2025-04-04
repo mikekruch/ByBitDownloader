@@ -1,6 +1,5 @@
 import sys
 import asyncio
-from asyncio import Queue, Semaphore, Lock
 import aiohttp
 import asyncpg
 import ctypes
@@ -10,10 +9,11 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                              QDialog, QFormLayout, QMessageBox, QTableWidgetItem, QHeaderView,
                              QStyledItemDelegate, QStyleOptionProgressBar, QStyle, QProgressBar,
                              QStatusBar)
-from PyQt5.QtCore import Qt, QSettings, QTimer, pyqtSignal
+from PyQt5.QtCore import Qt, QSettings, pyqtSignal
 from PyQt5.QtGui import QKeyEvent, QIntValidator
 from qasync import QEventLoop, asyncSlot
 import logging
+
 logging.basicConfig(filename='downloader.log', level=logging.INFO)
 
 # Настройки для Windows
@@ -57,7 +57,7 @@ class ProgressBarDelegate(QStyledItemDelegate):
         size = super().sizeHint(option, index)
         size.setHeight(size.height() * 2)
         return size
-    
+
 class NumericTableWidgetItem(QTableWidgetItem):
     def __lt__(self, other):
         try:
@@ -154,7 +154,6 @@ class SettingsDialog(QDialog):
         settings.setValue("settings/threads", self.threads_edit.text())
         self.accept()
 
-
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -171,12 +170,10 @@ class MainWindow(QMainWindow):
         self.download_progress = {}
         self.total_tasks = 0
         self.completed_tasks = 0
-        self.timers = []
         self.pool = None
         self.download_threads = int(self.settings.value("settings/threads", "5"))
         self.total_minutes = 0
         self.completed_minutes = 0
-        self.progress_update_timer = None
         self.calculated_tickers = 0
         self.total_tickers_to_calculate = 0
         self.active_threads = 0
@@ -184,22 +181,7 @@ class MainWindow(QMainWindow):
         self.init_ui()
         self.refresh_tickers()
         self.load_selected_tickers()
-        
-        self.add_timer(1000, self.update_progress_bars)
     
-        # Настройка таймеров
-        self.progress_timer = QTimer()
-        self.progress_timer.setTimerType(Qt.VeryCoarseTimer)  # Меньше точность, но стабильнее
-        self.progress_timer.timeout.connect(self.safe_update_progress)
-        self.progress_timer.start(1000)  # Обновление раз в секунду
-    
-    def safe_update_progress(self):
-        try:
-            self.update_progress_bars()
-        except RuntimeError as e:
-            if "wrapped C/C++ object" in str(e):
-                self.progress_timer.stop()
-            
     def update_status_bar(self, message):
         """Обновление строки состояния"""
         self.status_bar.showMessage(message)
@@ -214,28 +196,26 @@ class MainWindow(QMainWindow):
         else:
             self.update_status_bar(f"Активных потоков: {self.active_threads}")
 
-    def update_progress_bars(self):
-        """Обновление прогресс-баров"""
+    def update_progress_ui(self, symbol, end_date=None):
+        """Обновляет только связанные с тикером элементы UI"""
+        # Обновляем прогресс-бар для конкретного тикера
         for row in range(self.tickers_table.rowCount()):
-            item = self.tickers_table.item(row, 0)
-            if item is not None:  # Добавляем проверку на None
-                symbol = item.text()
-                if symbol in self.download_progress:
-                    progress_item = self.tickers_table.item(row, 4)
-                    if progress_item is not None:  # Добавляем проверку на None
-                        progress = self.download_progress[symbol]
-                        progress_item.setData(Qt.DisplayRole, progress)
+            if self.tickers_table.item(row, 0).text() == symbol:
+                progress_item = self.tickers_table.item(row, 4)
+                if progress_item:
+                    progress_item.setData(Qt.DisplayRole, self.download_progress[symbol])
+                    if end_date:
+                        progress_item.setData(Qt.UserRole, end_date)
+                break
         
-        self.update_global_progress()
+        # Обновляем общий прогресс
+        if self.total_minutes > 0:
+            progress = int((self.completed_minutes / self.total_minutes) * 100)
+            self.global_progress.setValue(progress)
+            self.global_progress.setFormat(f"{progress}% ({self.completed_minutes:,}/{self.total_minutes:,} минут)")
+        
+        # Принудительное обновление виджета
         self.tickers_table.viewport().update()
-
-    def add_timer(self, interval, callback):
-        """Создание таймера"""
-        timer = QTimer(self)
-        timer.timeout.connect(callback)
-        timer.start(interval)
-        self.timers.append(timer)
-        return timer
     
     def init_ui(self):
         central_widget = QWidget()
@@ -246,7 +226,7 @@ class MainWindow(QMainWindow):
         period_layout = QHBoxLayout()
         period_layout.addWidget(QLabel("С:"))
         self.from_datetime = QDateTimeEdit()
-        self.from_datetime.setDateTime(datetime.strptime('2021-08-01 00:00', '%Y-%m-%d %H:%M'))
+        self.from_datetime.setDateTime(datetime.strptime('2021-08-01 00:00', '%Y-%m-%d %H:%M')) #datetime.now() - timedelta(days=7))
         self.from_datetime.setDisplayFormat("yyyy-MM-dd HH:mm")
         period_layout.addWidget(self.from_datetime)
         
@@ -358,20 +338,9 @@ class MainWindow(QMainWindow):
         self.update_status_bar("Готово")
         
         central_widget.setLayout(layout)
-
-        self.progress_update_timer = self.add_timer(1000, self.update_progress_bars)
     
     def closeEvent(self, event):
         self.shutdown = True
-        
-        # Остановка всех таймеров
-        if hasattr(self, 'progress_timer'):
-            self.progress_timer.stop()
-    
-        for timer in self.timers:
-            timer.stop()
-            timer.deleteLater()
-        self.timers.clear()
         
         if self.pool is not None:
             try:
@@ -485,7 +454,7 @@ class MainWindow(QMainWindow):
             self.tickers_table.setItem(row, 1, volume_item)
             
             change_item = QTableWidgetItem(f"{float(change)*100:.2f}%")
-            change_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)  # Исправлено здесь
+            change_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
             self.tickers_table.setItem(row, 2, change_item)
             
             try:
@@ -506,51 +475,31 @@ class MainWindow(QMainWindow):
             if symbol in self.selected_tickers:
                 for col in range(5):
                     item = self.tickers_table.item(row, col)
-                    if item is not None:
+                    if item:
                         item.setSelected(True)
         
         self.tickers_table.sortItems(self.current_sort_column, self.current_sort_order)
-        
+    
     def load_selected_tickers(self):
-        """Загружает сохраненные тикеры из настроек"""
         selected = self.settings.value("selected_tickers", [])
         if isinstance(selected, str):
             selected = [selected] if selected else []
-        self.selected_tickers = set(selected)    
+        self.selected_tickers = set(selected)
     
     def save_selected_tickers(self):
-        """Сохраняет выбранные тикеры в настройки"""
         selected = []
         for row in range(self.tickers_table.rowCount()):
             if self.tickers_table.item(row, 0).isSelected():
                 selected.append(self.tickers_table.item(row, 0).text())
-        
         self.selected_tickers = set(selected)
         self.settings.setValue("selected_tickers", selected)
         self.update_status_bar(f"Сохранено {len(selected)} тикеров")
-        QMessageBox.information(self, "Сохранено", "Выбранные тикеры сохранены")    
-
+        QMessageBox.information(self, "Сохранено", "Выбранные тикеры сохранены")
+    
     def open_settings(self):
         dialog = SettingsDialog(self)
         dialog.exec_()
     
-    def update_progress(self, symbol, end_date=None):
-        for row in range(self.tickers_table.rowCount()):
-            if self.tickers_table.item(row, 0).text() == symbol:
-                progress_item = self.tickers_table.item(row, 4)
-                progress_data = self.download_progress.get(symbol, {'progress': 0, 'completed': 0, 'total': 0})
-                progress_item.setData(Qt.DisplayRole, progress_data)
-                if end_date:
-                    progress_item.setData(Qt.UserRole, end_date)
-                self.tickers_table.viewport().update()
-                break
-    
-    def update_global_progress(self):
-        if self.total_minutes > 0:
-            progress = int((self.completed_minutes / self.total_minutes) * 100)
-            self.global_progress.setValue(progress)
-            self.global_progress.setFormat(f"{progress}% ({self.completed_minutes:,}/{self.total_minutes:,} минут)")
-
     @asyncSlot()
     async def refresh_tickers(self):
         try:
@@ -584,7 +533,7 @@ class MainWindow(QMainWindow):
             self.update_status_bar(f"Ошибка: {str(e)}")
         finally:
             self.refresh_btn.setEnabled(True)
-        
+    
     async def start_loading(self):
         selected_tickers = []
         for row in range(self.tickers_table.rowCount()):
@@ -631,35 +580,54 @@ class MainWindow(QMainWindow):
                 semaphore = asyncio.Semaphore(self.download_threads)
                 download_tasks = []
                 calculation_tasks = []
-                
-                async def process_ticker(symbol):
-                    """Обрабатывает один тикер - анализирует и загружает данные"""
+                ticker_queue = asyncio.Queue()
+
+                async def calculate_missing_periods(symbol):
+                    """Асинхронно рассчитывает недостающие периоды для символа"""
                     try:
-                        # Анализ недостающих данных
                         missing_periods = await self.check_missing_data(
                             pool, schema, symbol, start_date, end_date
                         )
                         
                         if missing_periods:
-                            # Рассчитываем общее количество минут для этого тикера
                             total_minutes = sum(
                                 (end - start).total_seconds() / 60 
                                 for start, end in missing_periods
                             )
                             
-                            # Обновляем прогресс
                             self.download_progress[symbol] = {
                                 'progress': 0,
                                 'total': int(total_minutes),
                                 'completed': 0
                             }
                             
-                            # Атомарно увеличиваем общее количество минут
+                            # Добавляем в очередь для загрузки
+                            await ticker_queue.put((symbol, missing_periods))
+                            
+                            # Атомарно увеличиваем счетчик минут
                             async with asyncio.Lock():
                                 self.total_minutes += int(total_minutes)
+                        else:
+                            self.download_progress[symbol] = {
+                                'progress': 100,
+                                'total': 0,
+                                'completed': 0
+                            }
+                        
+                    except Exception as e:
+                        logging.error(f"Ошибка расчета для {symbol}: {str(e)}")
+                        self.update_status_bar(f"Ошибка расчета для {symbol}")
+
+                async def download_worker():
+                    """Рабочий процесс для загрузки данных"""
+                    while not self.shutdown:
+                        try:
+                            symbol, periods = await asyncio.wait_for(
+                                ticker_queue.get(), 
+                                timeout=1.0
+                            )
                             
-                            # Запускаем загрузку для каждого периода
-                            for period_start, period_end in missing_periods:
+                            for period_start, period_end in periods:
                                 if self.shutdown:
                                     break
                                     
@@ -671,26 +639,33 @@ class MainWindow(QMainWindow):
                                     )
                                 )
                                 download_tasks.append(task)
-                        else:
-                            self.download_progress[symbol] = {
-                                'progress': 100,
-                                'total': 0,
-                                'completed': 0
-                            }
-                        
-                        self.calculated_tickers += 1
-                        self.update_calculation_progress()
-                        
-                    except Exception as e:
-                        logging.error(f"Ошибка обработки тикера {symbol}: {str(e)}")
-                        self.update_status_bar(f"Ошибка обработки {symbol}")
+                                
+                            ticker_queue.task_done()
+                        except asyncio.TimeoutError:
+                            # Проверяем, все ли задачи расчета завершены
+                            if all(t.done() for t in calculation_tasks):
+                                break
 
-                # Запускаем анализ и загрузку для каждого тикера
+                # Запускаем рабочие процессы для загрузки (по числу потоков)
+                download_workers = [
+                    asyncio.create_task(download_worker()) 
+                    for _ in range(self.download_threads)
+                ]
+
+                # Запускаем расчет для всех тикеров
                 for symbol in selected_tickers:
-                    calculation_tasks.append(asyncio.create_task(process_ticker(symbol)))
-                
-                # Ждем завершения всех задач анализа
+                    calculation_tasks.append(asyncio.create_task(
+                        calculate_missing_periods(symbol))
+                    )
+
+                # Ждем завершения всех задач расчета
                 await asyncio.gather(*calculation_tasks)
+                
+                # Даем время рабочим процессам завершить загрузку
+                await asyncio.wait_for(
+                    asyncio.gather(*download_workers), 
+                    timeout=10.0
+                )
                 
                 # Ждем завершения оставшихся задач загрузки
                 if download_tasks and not self.shutdown:
@@ -806,11 +781,10 @@ class MainWindow(QMainWindow):
         try:
             async with semaphore:
                 table_name = f"klines_{symbol.lower()}"
-                total_minutes = (end_date - start_date).total_seconds() / 60
+                total_minutes = int((end_date - start_date).total_seconds() / 60)
                 processed_minutes = 0
                 
-                self.update_progress(symbol, start_date)
-                
+                # Создаем таблицу если не существует
                 async with pool.acquire() as conn:
                     await conn.execute(f"""
                     CREATE TABLE IF NOT EXISTS {schema}.{table_name} (
@@ -830,37 +804,48 @@ class MainWindow(QMainWindow):
                     while current_start < end_date and not self.shutdown:
                         current_end = min(current_start + timedelta(minutes=600), end_date)
                         
+                        # Получаем данные
                         klines = await self.fetch_klines(session, symbol, start_time=current_start, end_time=current_end)
                         
-                        if klines is None:  # Если fetch_klines вернул None после всех попыток
+                        if klines is None:
                             self.shutdown = True
                             break
                             
-                        if klines:  # Если данные получены успешно
+                        if klines:
+                            # Вставляем данные в базу
                             await self.save_klines(pool, schema, table_name, klines)
+                            
+                            # Обновляем прогресс после успешной вставки
                             last_timestamp = datetime.fromtimestamp(int(klines[0][0]) / 1000)
                             minutes_processed = int((last_timestamp - current_start).total_seconds() / 60)
                             processed_minutes += minutes_processed
                             self.completed_minutes += minutes_processed
                             current_start = last_timestamp + timedelta(minutes=1)
                             
+                            # Обновляем UI
                             progress = int((processed_minutes / total_minutes) * 100)
-                            self.download_progress[symbol]['progress'] = min(progress, 100)
-                            self.download_progress[symbol]['completed'] = processed_minutes
-                            self.update_progress(symbol, current_start)
-                            self.update_global_progress()
+                            self.download_progress[symbol] = {
+                                'progress': min(progress, 100),
+                                'completed': processed_minutes,
+                                'total': total_minutes
+                            }
+                            self.update_progress_ui(symbol, current_start)
                         else:
-                            minutes_processed = (current_end - current_start).total_seconds() / 60
+                            minutes_processed = int((current_end - current_start).total_seconds() / 60)
                             processed_minutes += minutes_processed
                             self.completed_minutes += minutes_processed
                             current_start = current_end
                         
+                        # Небольшая пауза чтобы не перегружать систему
                         await asyncio.sleep(0.1)
                     
                     if not self.shutdown:
-                        self.download_progress[symbol]['progress'] = 100
-                        self.download_progress[symbol]['completed'] = self.download_progress[symbol]['total']
-                        self.update_progress(symbol, end_date)
+                        self.download_progress[symbol] = {
+                            'progress': 100,
+                            'completed': processed_minutes,
+                            'total': total_minutes
+                        }
+                        self.update_progress_ui(symbol, end_date)
         except Exception as e:
             error_msg = f"Ошибка при загрузке {symbol}: {str(e)}"
             logging.error(error_msg)
