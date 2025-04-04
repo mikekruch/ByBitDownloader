@@ -223,6 +223,10 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout()
         
         # Период загрузки
+        period_container = QWidget()
+        period_container_layout = QHBoxLayout()
+        period_container_layout.setAlignment(Qt.AlignCenter)  # Центрирование по горизонтали
+    
         period_layout = QHBoxLayout()
         period_layout.addWidget(QLabel("С:"))
         self.from_datetime = QDateTimeEdit()
@@ -236,7 +240,9 @@ class MainWindow(QMainWindow):
         self.to_datetime.setDisplayFormat("yyyy-MM-dd HH:mm")
         period_layout.addWidget(self.to_datetime)
         
-        layout.addLayout(period_layout)
+        period_container_layout.addLayout(period_layout)
+        period_container.setLayout(period_container_layout)
+        layout.addWidget(period_container)
         
         # Фильтр тикеров
         filter_layout = QHBoxLayout()
