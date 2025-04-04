@@ -40,9 +40,7 @@ class ProgressBarDelegate(QStyledItemDelegate):
             QApplication.style().drawControl(QStyle.CE_ProgressBar, opt, painter)
             
             painter.save()
-            text = f"{progress}%\n{completed:,}/{total:,} min"
-            if end_date:
-                text += f"\n{end_date.strftime('%d.%m.%y %H:%M')}"
+            text = f"{progress}% {completed:,}/{total:,} min"
             
             font = painter.font()
             font.setPointSize(8)
@@ -79,7 +77,6 @@ class SortableTableWidget(QTableWidget):
         self.last_selected_row = -1
         self.setSelectionMode(QTableWidget.MultiSelection)
         self.setSelectionBehavior(QTableWidget.SelectRows)
-        self.loop = asyncio.get_event_loop()
 
     def mousePressEvent(self, event):
         if event.modifiers() & Qt.ShiftModifier:
@@ -249,7 +246,7 @@ class MainWindow(QMainWindow):
         period_layout = QHBoxLayout()
         period_layout.addWidget(QLabel("С:"))
         self.from_datetime = QDateTimeEdit()
-        self.from_datetime.setDateTime(datetime.now() - timedelta(days=7))
+        self.from_datetime.setDateTime(datetime.strptime('2021-08-01 00:00', '%Y-%m-%d %H:%M'))
         self.from_datetime.setDisplayFormat("yyyy-MM-dd HH:mm")
         period_layout.addWidget(self.from_datetime)
         
@@ -842,7 +839,7 @@ class MainWindow(QMainWindow):
                         if klines:  # Если данные получены успешно
                             await self.save_klines(pool, schema, table_name, klines)
                             last_timestamp = datetime.fromtimestamp(int(klines[0][0]) / 1000)
-                            minutes_processed = (last_timestamp - current_start).total_seconds() / 60
+                            minutes_processed = int((last_timestamp - current_start).total_seconds() / 60)
                             processed_minutes += minutes_processed
                             self.completed_minutes += minutes_processed
                             current_start = last_timestamp + timedelta(minutes=1)
@@ -995,26 +992,41 @@ class MainWindow(QMainWindow):
             )
 
 def run_app():
+    # Устанавливаем политику event loop для Windows
+    if sys.platform == 'win32':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    
     app = QApplication(sys.argv)
     
     # Настройки для Windows
     if sys.platform == 'win32':
         app.setAttribute(Qt.AA_DisableWindowContextHelpButton)
         app.setStyle('Fusion')
-        # Уменьшаем количество используемых таймеров
         app.setAttribute(Qt.AA_Use96Dpi)
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('ByBitDownloader')
     
     # Настройка event loop
     loop = QEventLoop(app)
     asyncio.set_event_loop(loop)
     
-    # Устанавливаем таймер для периодической обработки событий
-    timer = QTimer()
-    timer.start(500)  # Обновление каждые 500 мс
-    timer.timeout.connect(lambda: None)  # Пустой обработчик
-    
+    # Создаем и настраиваем главное окно
     window = MainWindow()
     window.show()
     
+    # Запускаем event loop
     with loop:
-        sys.exit(loop.run_forever())
+        try:
+            loop.run_forever()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            loop.close()
+
+if __name__ == "__main__":
+    try:
+        run_app()
+    except Exception as e:
+        print(f"Critical error: {str(e)}")
+        logging.exception("Application crashed")
+        sys.exit(1)
