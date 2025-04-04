@@ -19,6 +19,7 @@ logging.basicConfig(filename='downloader.log', level=logging.INFO)
 # Настройки для Windows
 if sys.platform == 'win32':
     ctypes.windll.kernel32.SetDllDirectoryW(None)
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 class ProgressBarDelegate(QStyledItemDelegate):
     def paint(self, painter, option, index):
@@ -189,6 +190,19 @@ class MainWindow(QMainWindow):
         
         self.add_timer(1000, self.update_progress_bars)
     
+        # Настройка таймеров
+        self.progress_timer = QTimer()
+        self.progress_timer.setTimerType(Qt.VeryCoarseTimer)  # Меньше точность, но стабильнее
+        self.progress_timer.timeout.connect(self.safe_update_progress)
+        self.progress_timer.start(1000)  # Обновление раз в секунду
+    
+    def safe_update_progress(self):
+        try:
+            self.update_progress_bars()
+        except RuntimeError as e:
+            if "wrapped C/C++ object" in str(e):
+                self.progress_timer.stop()
+            
     def update_status_bar(self, message):
         """Обновление строки состояния"""
         self.status_bar.showMessage(message)
@@ -353,6 +367,10 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         self.shutdown = True
         
+        # Остановка всех таймеров
+        if hasattr(self, 'progress_timer'):
+            self.progress_timer.stop()
+    
         for timer in self.timers:
             timer.stop()
             timer.deleteLater()
@@ -581,7 +599,6 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Ошибка", "Не выбраны тикеры для загрузки")
             return
         
-        # Инициализация параметров загрузки
         start_date = self.from_datetime.dateTime().toPyDateTime()
         end_date = self.to_datetime.dateTime().toPyDateTime()
         
@@ -590,13 +607,12 @@ class MainWindow(QMainWindow):
         self.stop_btn.setEnabled(True)
         self.setCursor(Qt.WaitCursor)
         
-        # Сброс счетчиков прогресса
         self.total_minutes = 0
         self.completed_minutes = 0
         self.calculated_tickers = 0
         self.total_tickers_to_calculate = len(selected_tickers)
         self.active_threads = 0
-        
+
         try:
             settings = QSettings("settings.ini", QSettings.IniFormat)
             self.download_threads = int(settings.value("settings/threads", "5"))
@@ -619,26 +635,45 @@ class MainWindow(QMainWindow):
                 download_tasks = []
                 calculation_tasks = []
                 
-                # Создаем очередь для тикеров, готовых к загрузке
-                ticker_queue = asyncio.Queue()
-                
-                async def calculate_missing_periods(symbol):
-                    """Асинхронно рассчитывает недостающие периоды для символа"""
+                async def process_ticker(symbol):
+                    """Обрабатывает один тикер - анализирует и загружает данные"""
                     try:
-                        missing_periods = await self.check_missing_data(pool, schema, symbol, start_date, end_date)
+                        # Анализ недостающих данных
+                        missing_periods = await self.check_missing_data(
+                            pool, schema, symbol, start_date, end_date
+                        )
+                        
                         if missing_periods:
-                            total_minutes = sum((end - start).total_seconds() / 60 
-                                            for start, end in missing_periods)
+                            # Рассчитываем общее количество минут для этого тикера
+                            total_minutes = sum(
+                                (end - start).total_seconds() / 60 
+                                for start, end in missing_periods
+                            )
+                            
+                            # Обновляем прогресс
                             self.download_progress[symbol] = {
                                 'progress': 0,
                                 'total': int(total_minutes),
                                 'completed': 0
                             }
-                            # Добавляем в очередь для загрузки
-                            await ticker_queue.put((symbol, missing_periods))
-                            # Атомарно увеличиваем счетчик минут
+                            
+                            # Атомарно увеличиваем общее количество минут
                             async with asyncio.Lock():
                                 self.total_minutes += int(total_minutes)
+                            
+                            # Запускаем загрузку для каждого периода
+                            for period_start, period_end in missing_periods:
+                                if self.shutdown:
+                                    break
+                                    
+                                task = asyncio.create_task(
+                                    self.download_symbol_data(
+                                        pool, schema, symbol,
+                                        period_start, period_end,
+                                        semaphore
+                                    )
+                                )
+                                download_tasks.append(task)
                         else:
                             self.download_progress[symbol] = {
                                 'progress': 100,
@@ -648,55 +683,17 @@ class MainWindow(QMainWindow):
                         
                         self.calculated_tickers += 1
                         self.update_calculation_progress()
+                        
                     except Exception as e:
-                        logging.error(f"Ошибка расчета для {symbol}: {str(e)}")
-                        self.update_status_bar(f"Ошибка расчета для {symbol}")
-                
-                async def download_worker():
-                    """Рабочий процесс для загрузки данных"""
-                    while not self.shutdown:
-                        try:
-                            symbol, periods = await asyncio.wait_for(
-                                ticker_queue.get(), 
-                                timeout=1.0
-                            )
-                            
-                            for period_start, period_end in periods:
-                                if self.shutdown:
-                                    break
-                                task = asyncio.create_task(
-                                    self.download_symbol_data(
-                                        pool, schema, symbol, 
-                                        period_start, period_end, 
-                                        semaphore
-                                    )
-                                )
-                                download_tasks.append(task)
-                                
-                            ticker_queue.task_done()
-                        except asyncio.TimeoutError:
-                            if ticker_queue.empty() and all(t.done() for t in calculation_tasks):
-                                break
-                
-                # Запускаем рабочие процессы для загрузки
-                download_workers = [
-                    asyncio.create_task(download_worker()) 
-                    for _ in range(self.download_threads)
-                ]
-                
-                # Запускаем расчет недостающих периодов для всех тикеров
+                        logging.error(f"Ошибка обработки тикера {symbol}: {str(e)}")
+                        self.update_status_bar(f"Ошибка обработки {symbol}")
+
+                # Запускаем анализ и загрузку для каждого тикера
                 for symbol in selected_tickers:
-                    calculation_tasks.append(asyncio.create_task(
-                        calculate_missing_periods(symbol)
-                    ))
+                    calculation_tasks.append(asyncio.create_task(process_ticker(symbol)))
                 
-                # Ждем завершения всех задач
+                # Ждем завершения всех задач анализа
                 await asyncio.gather(*calculation_tasks)
-                await ticker_queue.join()
-                
-                # Отменяем рабочие процессы загрузки
-                for worker in download_workers:
-                    worker.cancel()
                 
                 # Ждем завершения оставшихся задач загрузки
                 if download_tasks and not self.shutdown:
@@ -844,7 +841,7 @@ class MainWindow(QMainWindow):
                             
                         if klines:  # Если данные получены успешно
                             await self.save_klines(pool, schema, table_name, klines)
-                            last_timestamp = datetime.utcfromtimestamp(int(klines[0][0]) / 1000)
+                            last_timestamp = datetime.fromtimestamp(int(klines[0][0]) / 1000)
                             minutes_processed = (last_timestamp - current_start).total_seconds() / 60
                             processed_minutes += minutes_processed
                             self.completed_minutes += minutes_processed
@@ -1000,22 +997,24 @@ class MainWindow(QMainWindow):
 def run_app():
     app = QApplication(sys.argv)
     
+    # Настройки для Windows
     if sys.platform == 'win32':
         app.setAttribute(Qt.AA_DisableWindowContextHelpButton)
         app.setStyle('Fusion')
+        # Уменьшаем количество используемых таймеров
+        app.setAttribute(Qt.AA_Use96Dpi)
     
+    # Настройка event loop
     loop = QEventLoop(app)
     asyncio.set_event_loop(loop)
+    
+    # Устанавливаем таймер для периодической обработки событий
+    timer = QTimer()
+    timer.start(500)  # Обновление каждые 500 мс
+    timer.timeout.connect(lambda: None)  # Пустой обработчик
     
     window = MainWindow()
     window.show()
     
     with loop:
-        loop.run_forever()
-
-if __name__ == "__main__":
-    try:
-        from qasync import QEventLoop
-        run_app()
-    except ImportError as e:
-        sys.exit(1)
+        sys.exit(loop.run_forever())
